@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   ArrowUpRight,
   Package,
+  RefreshCw,
   ShoppingCart,
   TrendingUp,
 } from 'lucide-react';
@@ -12,6 +13,8 @@ import type { DashboardPayload, ReorderItem } from '../types';
 interface DashboardViewProps {
   data: DashboardPayload | null;
   loading: boolean;
+  error?: string | null;
+  onRetry?: () => void;
   onNavigateBilling: (medicineId?: number) => void;
   onNavigateExpiry: () => void;
   onCreatePoFromReorder: (item: ReorderItem) => void;
@@ -20,13 +23,15 @@ interface DashboardViewProps {
 export function DashboardView({
   data,
   loading,
+  error,
+  onRetry,
   onNavigateBilling,
   onNavigateExpiry,
   onCreatePoFromReorder,
 }: DashboardViewProps) {
   const [shelfFilter, setShelfFilter] = useState<'all' | 'critical' | 'amber' | 'green'>('all');
 
-  if (loading || !data) {
+  if (loading && !data) {
     return (
       <div className="space-y-6">
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
@@ -35,6 +40,31 @@ export function DashboardView({
           ))}
         </div>
         <div className="h-80 bg-white border border-slate-200 rounded-xl animate-pulse" />
+      </div>
+    );
+  }
+
+  if (!data) {
+    return (
+      <div className="bg-white border border-slate-200 rounded-xl p-8 text-center max-w-lg mx-auto my-8 space-y-4">
+        <div className="w-11 h-11 rounded-xl bg-amber-50 border border-amber-200 text-amber-700 flex items-center justify-center mx-auto">
+          <AlertTriangle className="w-5 h-5" />
+        </div>
+        <div className="space-y-1">
+          <h2 className="text-base font-bold text-slate-900">Unable to load pharmacy dashboard</h2>
+          <p className="text-xs text-slate-500">
+            {error || 'The dashboard telemetry request did not complete. Retry to initialize the workspace.'}
+          </p>
+        </div>
+        {onRetry && (
+          <button
+            type="button"
+            onClick={onRetry}
+            className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors cursor-pointer"
+          >
+            <RefreshCw className="w-3.5 h-3.5" /> Retry Loading Dashboard
+          </button>
+        )}
       </div>
     );
   }

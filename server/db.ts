@@ -1,9 +1,27 @@
 import Database from 'better-sqlite3';
+import fs from 'node:fs';
 import path from 'path';
 
-const dbPath = path.resolve(process.cwd(), 'medoryx.db');
+function resolveDbPath(): string {
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    return path.join('/tmp', 'medoryx.db');
+  }
+  const localPath = path.resolve(process.cwd(), 'medoryx.db');
+  try {
+    fs.accessSync(process.cwd(), fs.constants.W_OK);
+    return localPath;
+  } catch {
+    return path.join('/tmp', 'medoryx.db');
+  }
+}
+
+const dbPath = resolveDbPath();
 const db = new Database(dbPath);
-db.pragma('journal_mode = WAL');
+try {
+  db.pragma('journal_mode = WAL');
+} catch {
+  // Fallback if filesystem does not support WAL shm
+}
 db.pragma('foreign_keys = ON');
 
 function addDaysIso(offsetDays: number): string {

@@ -1,5 +1,6 @@
-import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
+import { Component, type ErrorInfo, type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   BarChart3,
   ClipboardList,
   CreditCard,
@@ -8,6 +9,7 @@ import {
   Menu,
   Package,
   Plus,
+  RefreshCw,
   RotateCcw,
   Truck,
   X,
@@ -16,26 +18,56 @@ import { apiFetch } from './lib/format';
 import { MedoryxLogo } from './components/MedoryxLogo';
 import { LoginView } from './components/LoginView';
 import { DashboardView } from './components/DashboardView';
-import type { CartEntry } from './components/BillingView';
+import { PrescriptionsView } from './components/PrescriptionsView';
+import { BillingView, type CartEntry } from './components/BillingView';
+import { InventoryView } from './components/InventoryView';
+import { ReturnsView } from './components/ReturnsView';
+import { ProcurementView } from './components/ProcurementView';
+import { ReportsView } from './components/ReportsView';
 
-const PrescriptionsView = lazy(() =>
-  import('./components/PrescriptionsView').then((m) => ({ default: m.PrescriptionsView }))
-);
-const BillingView = lazy(() =>
-  import('./components/BillingView').then((m) => ({ default: m.BillingView }))
-);
-const InventoryView = lazy(() =>
-  import('./components/InventoryView').then((m) => ({ default: m.InventoryView }))
-);
-const ReturnsView = lazy(() =>
-  import('./components/ReturnsView').then((m) => ({ default: m.ReturnsView }))
-);
-const ProcurementView = lazy(() =>
-  import('./components/ProcurementView').then((m) => ({ default: m.ProcurementView }))
-);
-const ReportsView = lazy(() =>
-  import('./components/ReportsView').then((m) => ({ default: m.ReportsView }))
-);
+interface ErrorBoundaryState {
+  hasError: boolean;
+  message: string;
+}
+
+class WorkspaceErrorBoundary extends Component<{ children: ReactNode; onReset: () => void }, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { hasError: false, message: '' };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, message: error.message || 'Unexpected rendering error' };
+  }
+
+  componentDidCatch(_error: Error, _info: ErrorInfo) {
+    // Error captured in state for user recovery
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="bg-white border border-slate-200 rounded-xl p-8 text-center max-w-lg mx-auto my-8 space-y-4">
+          <div className="w-11 h-11 rounded-xl bg-red-50 border border-red-200 text-red-600 flex items-center justify-center mx-auto">
+            <AlertTriangle className="w-5 h-5" />
+          </div>
+          <div className="space-y-1">
+            <h2 className="text-base font-bold text-slate-900">Workspace view encountered an issue</h2>
+            <p className="text-xs text-slate-500">{this.state.message}</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              this.setState({ hasError: false, message: '' });
+              this.props.onReset();
+            }}
+            className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors cursor-pointer"
+          >
+            <RefreshCw className="w-3.5 h-3.5" /> Reload Workspace
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 import type {
   Batch,
   DashboardPayload,
@@ -83,6 +115,7 @@ export default function App() {
 
   // Shared live SQLite data state
   const [loading, setLoading] = useState(false);
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [dashboard, setDashboard] = useState<DashboardPayload | null>(null);
   const [medicines, setMedicines] = useState<Medicine[]>([]);
   const [batches, setBatches] = useState<Batch[]>([]);
@@ -112,6 +145,7 @@ export default function App() {
 
   const refreshAll = useCallback(async () => {
     setLoading(true);
+    setBootstrapError(null);
     try {
       const data = await apiFetch<{
         dashboard: DashboardPayload;
@@ -135,7 +169,9 @@ export default function App() {
       setGrnRecords(data.grn_records);
       hasBootstrappedRef.current = true;
     } catch (err) {
-      notify(err instanceof Error ? err.message : 'Failed to load workspace data', 'error');
+      const message = err instanceof Error ? err.message : 'Failed to load workspace data';
+      setBootstrapError(message);
+      notify(message, 'error');
     } finally {
       setLoading(false);
     }
@@ -369,18 +405,18 @@ export default function App() {
 
         {/* Main Scrollable Viewport */}
         <main className="flex-1 p-6 max-w-[1400px] w-full mx-auto">
-          <Suspense
-            fallback={
-              <div className="space-y-4">
-                <div className="h-24 bg-white border border-slate-200 rounded-xl animate-pulse" />
-                <div className="h-64 bg-white border border-slate-200 rounded-xl animate-pulse" />
-              </div>
-            }
+          <WorkspaceErrorBoundary
+            onReset={() => {
+              setActiveModule('dashboard');
+              refreshAll();
+            }}
           >
             {activeModule === 'dashboard' && (
               <DashboardView
                 data={dashboard}
                 loading={loading && !dashboard}
+                error={bootstrapError}
+                onRetry={refreshAll}
                 onNavigateBilling={handleNavigateBilling}
                 onNavigateExpiry={() => {
                   setInventorySubTab('expiry');
@@ -453,7 +489,7 @@ export default function App() {
             )}
 
             {activeModule === 'reports' && <ReportsView batches={batches} />}
-          </Suspense>
+          </WorkspaceErrorBoundary>
         </main>
       </div>
 

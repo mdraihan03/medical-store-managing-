@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Database, Download, X } from 'lucide-react';
-import { apiFetch, formatDateTime, formatINR, formatShortDate } from '../lib/format';
+import { apiFetch, fetchTextWithFallback, formatDateTime, formatINR, formatShortDate } from '../lib/format';
 import type { AuditLog, Batch } from '../types';
 
 interface ReportsOverview {
@@ -44,8 +44,7 @@ export function ReportsView({ batches }: ReportsViewProps) {
   }, [batches]);
 
   async function openMysqlSchema() {
-    const res = await fetch('/api/schema/mysql');
-    const txt = await res.text();
+    const txt = await fetchTextWithFallback('/api/schema/mysql');
     setMysqlModal(txt);
   }
 

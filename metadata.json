@@ -1,0 +1,6 @@
+{
+  "name": "Medoryx",
+  "description": "Medical Store Management System with FEFO expiry-aware GST billing, 90-day expiry risk shelf, brand-swap suggestions, live drug-interaction alerts, EMR prescriptions, and SQLite inventory control.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

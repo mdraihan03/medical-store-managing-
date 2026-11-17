@@ -194,6 +194,14 @@ export function initDatabase(): void {
       details TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE INDEX IF NOT EXISTS idx_batches_fefo ON batches(medicine_id, status, expiry_date);
+    CREATE INDEX IF NOT EXISTS idx_batches_expiry ON batches(expiry_date, qty_available);
+    CREATE INDEX IF NOT EXISTS idx_invoice_items_inv ON invoice_items(invoice_id);
+    CREATE INDEX IF NOT EXISTS idx_invoice_items_med ON invoice_items(medicine_id);
+    CREATE INDEX IF NOT EXISTS idx_invoices_created ON invoices(created_at);
+    CREATE INDEX IF NOT EXISTS idx_rx_items_rx ON emr_prescription_items(prescription_id);
+    CREATE INDEX IF NOT EXISTS idx_po_items_po ON purchase_order_items(po_id);
   `);
 
   const userCount = (db.prepare('SELECT COUNT(*) as cnt FROM users').get() as { cnt: number }).cnt;

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import {
   BarChart3,
   ClipboardList,
@@ -16,12 +16,26 @@ import { apiFetch } from './lib/format';
 import { MedoryxLogo } from './components/MedoryxLogo';
 import { LoginView } from './components/LoginView';
 import { DashboardView } from './components/DashboardView';
-import { PrescriptionsView } from './components/PrescriptionsView';
-import { BillingView, type CartEntry } from './components/BillingView';
-import { InventoryView } from './components/InventoryView';
-import { ReturnsView } from './components/ReturnsView';
-import { ProcurementView } from './components/ProcurementView';
-import { ReportsView } from './components/ReportsView';
+import type { CartEntry } from './components/BillingView';
+
+const PrescriptionsView = lazy(() =>
+  import('./components/PrescriptionsView').then((m) => ({ default: m.PrescriptionsView }))
+);
+const BillingView = lazy(() =>
+  import('./components/BillingView').then((m) => ({ default: m.BillingView }))
+);
+const InventoryView = lazy(() =>
+  import('./components/InventoryView').then((m) => ({ default: m.InventoryView }))
+);
+const ReturnsView = lazy(() =>
+  import('./components/ReturnsView').then((m) => ({ default: m.ReturnsView }))
+);
+const ProcurementView = lazy(() =>
+  import('./components/ProcurementView').then((m) => ({ default: m.ProcurementView }))
+);
+const ReportsView = lazy(() =>
+  import('./components/ReportsView').then((m) => ({ default: m.ReportsView }))
+);
 import type {
   Batch,
   DashboardPayload,
@@ -94,29 +108,32 @@ export default function App() {
     }, 3800);
   }, []);
 
+  const hasBootstrappedRef = useRef(false);
+
   const refreshAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [dash, meds, bat, rxs, invs, rets, sups, pos, grns] = await Promise.all([
-        apiFetch<DashboardPayload>('/api/dashboard'),
-        apiFetch<Medicine[]>('/api/medicines'),
-        apiFetch<Batch[]>('/api/batches'),
-        apiFetch<EmrPrescription[]>('/api/prescriptions'),
-        apiFetch<InvoiceRecord[]>('/api/invoices'),
-        apiFetch<ReturnRecord[]>('/api/returns'),
-        apiFetch<Supplier[]>('/api/suppliers'),
-        apiFetch<PurchaseOrder[]>('/api/purchase-orders'),
-        apiFetch<GrnRecord[]>('/api/grn'),
-      ]);
-      setDashboard(dash);
-      setMedicines(meds);
-      setBatches(bat);
-      setPrescriptions(rxs);
-      setInvoices(invs);
-      setReturns(rets);
-      setSuppliers(sups);
-      setPurchaseOrders(pos);
-      setGrnRecords(grns);
+      const data = await apiFetch<{
+        dashboard: DashboardPayload;
+        medicines: Medicine[];
+        batches: Batch[];
+        prescriptions: EmrPrescription[];
+        invoices: InvoiceRecord[];
+        returns: ReturnRecord[];
+        suppliers: Supplier[];
+        purchase_orders: PurchaseOrder[];
+        grn_records: GrnRecord[];
+      }>('/api/bootstrap');
+      setDashboard(data.dashboard);
+      setMedicines(data.medicines);
+      setBatches(data.batches);
+      setPrescriptions(data.prescriptions);
+      setInvoices(data.invoices);
+      setReturns(data.returns);
+      setSuppliers(data.suppliers);
+      setPurchaseOrders(data.purchase_orders);
+      setGrnRecords(data.grn_records);
+      hasBootstrappedRef.current = true;
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Failed to load workspace data', 'error');
     } finally {
@@ -125,8 +142,11 @@ export default function App() {
   }, [notify]);
 
   useEffect(() => {
-    if (user) {
+    if (user && !hasBootstrappedRef.current) {
       refreshAll();
+    }
+    if (!user) {
+      hasBootstrappedRef.current = false;
     }
   }, [user, refreshAll]);
 
@@ -349,82 +369,91 @@ export default function App() {
 
         {/* Main Scrollable Viewport */}
         <main className="flex-1 p-6 max-w-[1400px] w-full mx-auto">
-          {activeModule === 'dashboard' && (
-            <DashboardView
-              data={dashboard}
-              loading={loading && !dashboard}
-              onNavigateBilling={handleNavigateBilling}
-              onNavigateExpiry={() => {
-                setInventorySubTab('expiry');
-                setActiveModule('inventory');
-              }}
-              onCreatePoFromReorder={handleCreatePoFromReorder}
-            />
-          )}
+          <Suspense
+            fallback={
+              <div className="space-y-4">
+                <div className="h-24 bg-white border border-slate-200 rounded-xl animate-pulse" />
+                <div className="h-64 bg-white border border-slate-200 rounded-xl animate-pulse" />
+              </div>
+            }
+          >
+            {activeModule === 'dashboard' && (
+              <DashboardView
+                data={dashboard}
+                loading={loading && !dashboard}
+                onNavigateBilling={handleNavigateBilling}
+                onNavigateExpiry={() => {
+                  setInventorySubTab('expiry');
+                  setActiveModule('inventory');
+                }}
+                onCreatePoFromReorder={handleCreatePoFromReorder}
+              />
+            )}
 
-          {activeModule === 'prescriptions' && (
-            <PrescriptionsView
-              prescriptions={prescriptions}
-              medicines={medicines}
-              user={user}
-              onRefresh={refreshAll}
-              onSendToBilling={handleSendRxToBilling}
-              onNotify={notify}
-            />
-          )}
+            {activeModule === 'prescriptions' && (
+              <PrescriptionsView
+                prescriptions={prescriptions}
+                medicines={medicines}
+                user={user}
+                onRefresh={refreshAll}
+                onSendToBilling={handleSendRxToBilling}
+                onNotify={notify}
+              />
+            )}
 
-          {activeModule === 'billing' && (
-            <BillingView
-              medicines={medicines}
-              invoices={invoices}
-              user={user}
-              cart={cart}
-              setCart={setCart}
-              linkedRx={linkedRx}
-              setLinkedRx={setLinkedRx}
-              onRefreshAll={refreshAll}
-              onNotify={notify}
-            />
-          )}
+            {activeModule === 'billing' && (
+              <BillingView
+                medicines={medicines}
+                invoices={invoices}
+                user={user}
+                cart={cart}
+                setCart={setCart}
+                linkedRx={linkedRx}
+                setLinkedRx={setLinkedRx}
+                onRefreshAll={refreshAll}
+                onNotify={notify}
+              />
+            )}
 
-          {activeModule === 'inventory' && (
-            <InventoryView
-              key={inventorySubTab}
-              medicines={medicines}
-              batches={batches}
-              suppliers={suppliers}
-              user={user}
-              initialSubTab={inventorySubTab}
-              onRefresh={refreshAll}
-              onNotify={notify}
-            />
-          )}
+            {activeModule === 'inventory' && (
+              <InventoryView
+                key={inventorySubTab}
+                medicines={medicines}
+                batches={batches}
+                suppliers={suppliers}
+                user={user}
+                initialSubTab={inventorySubTab}
+                onRefresh={refreshAll}
+                onNotify={notify}
+              />
+            )}
 
-          {activeModule === 'returns' && (
-            <ReturnsView
-              batches={batches}
-              returns={returns}
-              user={user}
-              onRefresh={refreshAll}
-              onNotify={notify}
-            />
-          )}
+            {activeModule === 'returns' && (
+              <ReturnsView
+                batches={batches}
+                returns={returns}
+                user={user}
+                onRefresh={refreshAll}
+                onNotify={notify}
+              />
+            )}
 
-          {activeModule === 'procurement' && (
-            <ProcurementView
-              suppliers={suppliers}
-              purchaseOrders={purchaseOrders}
-              grnRecords={grnRecords}
-              medicines={medicines}
-              user={user}
-              prefillReorder={prefillReorder}
-              clearPrefillReorder={() => setPrefillReorder(null)}
-              onRefresh={refreshAll}
-              onNotify={notify}
-            />
-          )}
+            {activeModule === 'procurement' && (
+              <ProcurementView
+                suppliers={suppliers}
+                purchaseOrders={purchaseOrders}
+                grnRecords={grnRecords}
+                medicines={medicines}
+                user={user}
+                prefillReorder={prefillReorder}
+                clearPrefillReorder={() => setPrefillReorder(null)}
+                onRefresh={refreshAll}
+                onNotify={notify}
+              />
+            )}
 
-          {activeModule === 'reports' && <ReportsView batches={batches} />}
+            {activeModule === 'reports' && <ReportsView batches={batches} />}
+          </Suspense>
         </main>
       </div>
 

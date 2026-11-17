@@ -1,5 +1,6 @@
 import express from 'express';
 import path from 'path';
+import zlib from 'node:zlib';
 import { createServer as createViteServer } from 'vite';
 import db, { initDatabase } from './server/db.ts';
 import type {
@@ -68,18 +69,28 @@ function findBrandSwaps(medicineId: number, genericName: string): BrandSwapOptio
   }));
 }
 
+type InteractionRule = {
+  id: number;
+  generic_a: string;
+  generic_b: string;
+  severity: 'Mild' | 'Moderate' | 'Severe';
+  clinical_effect: string;
+  recommendation: string;
+};
+
+let cachedInteractionRules: InteractionRule[] | null = null;
+function getInteractionRules(): InteractionRule[] {
+  if (!cachedInteractionRules) {
+    cachedInteractionRules = db.prepare('SELECT * FROM drug_interactions').all() as InteractionRule[];
+  }
+  return cachedInteractionRules;
+}
+
 function checkInteractionsForMedicines(
   meds: Array<{ medicine_id: number; brand_name: string; generic_name: string }>
 ): DrugInteractionAlert[] {
   if (meds.length < 2) return [];
-  const rules = db.prepare('SELECT * FROM drug_interactions').all() as Array<{
-    id: number;
-    generic_a: string;
-    generic_b: string;
-    severity: 'Mild' | 'Moderate' | 'Severe';
-    clinical_effect: string;
-    recommendation: string;
-  }>;
+  const rules = getInteractionRules();
 
   const alerts: DrugInteractionAlert[] = [];
   const seenKeys = new Set<string>();
@@ -290,9 +301,487 @@ function mapBatchRow(b: {
   };
 }
 
+function getDashboardData() {
+  const allBatchRows = db
+    .prepare(
+      `
+      SELECT b.*, m.brand_name, m.generic_name, m.strength, m.category, m.gst_rate, m.hsn_code
+      FROM batches b
+      JOIN medicines m ON m.id = b.medicine_id
+      WHERE b.qty_available > 0
+      ORDER BY date(b.expiry_date) ASC
+      `
+    )
+    .all() as Parameters<typeof mapBatchRow>[0][];
+
+  const mappedBatches = allBatchRows.map(mapBatchRow);
+
+  let totalStockValue = 0;
+  let totalMrpValue = 0;
+  let atRisk90dValue = 0;
+  let atRisk90dUnits = 0;
+  let expiredValue = 0;
+
+  let criticalValue = 0;
+  let criticalBatches = 0;
+  let amberValue = 0;
+  let amberBatches = 0;
+  let greenValue = 0;
+  let greenBatches = 0;
+
+  const expiryShelf = [];
+
+  for (const b of mappedBatches) {
+    if (b.risk_tier === 'expired') {
+      expiredValue += b.cost_value_at_risk;
+    } else {
+      totalStockValue += b.cost_value_at_risk;
+      totalMrpValue += b.qty_available * b.mrp;
+      if (b.days_to_expiry <= 90) {
+        atRisk90dValue += b.cost_value_at_risk;
+        atRisk90dUnits += b.qty_available;
+        expiryShelf.push(b);
+        if (b.risk_tier === 'critical') {
+          criticalValue += b.cost_value_at_risk;
+          criticalBatches += 1;
+        } else if (b.risk_tier === 'amber') {
+          amberValue += b.cost_value_at_risk;
+          amberBatches += 1;
+        } else if (b.risk_tier === 'green') {
+          greenValue += b.cost_value_at_risk;
+          greenBatches += 1;
+        }
+      }
+    }
+  }
+
+  const reorderList = db
+    .prepare(
+      `
+      SELECT
+        m.id as medicine_id,
+        m.brand_name,
+        m.generic_name,
+        m.strength,
+        m.category,
+        COALESCE(SUM(CASE WHEN b.status = 'active' AND date(b.expiry_date) > date('now') THEN b.qty_available ELSE 0 END), 0) as current_stock,
+        m.reorder_level,
+        m.target_stock,
+        COALESCE(
+          (SELECT cost_price FROM batches b2 WHERE b2.medicine_id = m.id ORDER BY b2.id DESC LIMIT 1),
+          10.0
+        ) as est_unit_cost,
+        s.id as supplier_id,
+        s.name as supplier_name,
+        s.phone as supplier_phone,
+        s.email as supplier_email,
+        s.lead_time_days
+      FROM medicines m
+      JOIN suppliers s ON s.id = m.preferred_supplier_id
+      LEFT JOIN batches b ON b.medicine_id = m.id
+      GROUP BY m.id
+      HAVING current_stock <= m.reorder_level
+      ORDER BY (m.reorder_level - current_stock) DESC
+      `
+    )
+    .all() as Array<{
+    medicine_id: number;
+    brand_name: string;
+    generic_name: string;
+    strength: string;
+    category: string;
+    current_stock: number;
+    reorder_level: number;
+    target_stock: number;
+    est_unit_cost: number;
+    supplier_id: number;
+    supplier_name: string;
+    supplier_phone: string;
+    supplier_email: string;
+    lead_time_days: number;
+  }>;
+
+  const formattedReorder = reorderList.map((r) => {
+    const suggested = Math.max(r.target_stock - r.current_stock, r.reorder_level);
+    return {
+      ...r,
+      est_unit_cost: Number(r.est_unit_cost.toFixed(2)),
+      suggested_order_qty: suggested,
+      est_order_cost: Number((suggested * r.est_unit_cost).toFixed(2)),
+    };
+  });
+
+  const today = todayIso();
+  const todayStats = db
+    .prepare(
+      `
+      SELECT COALESCE(SUM(grand_total), 0) as rev, COUNT(*) as cnt
+      FROM invoices
+      WHERE date(created_at) = date(?)
+      `
+    )
+    .get(today) as { rev: number; cnt: number };
+
+  const pendingRxCount = (
+    db.prepare("SELECT COUNT(*) as cnt FROM emr_prescriptions WHERE status != 'Dispensed'").get() as { cnt: number }
+  ).cnt;
+
+  const fastMoving = db
+    .prepare(
+      `
+      SELECT
+        ii.medicine_id,
+        ii.brand_name,
+        ii.generic_name,
+        m.strength,
+        SUM(ii.qty) as units_sold,
+        ROUND(SUM(ii.line_total), 2) as revenue,
+        COALESCE((
+          SELECT SUM(qty_available) FROM batches b
+          WHERE b.medicine_id = ii.medicine_id AND b.status = 'active' AND date(b.expiry_date) > date('now')
+        ), 0) as current_stock
+      FROM invoice_items ii
+      JOIN medicines m ON m.id = ii.medicine_id
+      GROUP BY ii.medicine_id
+      ORDER BY units_sold DESC
+      LIMIT 6
+      `
+    )
+    .all();
+
+  const dailySalesRows = db
+    .prepare(
+      `
+      SELECT date(created_at) as d, COALESCE(SUM(grand_total), 0) as sales
+      FROM invoices
+      GROUP BY date(created_at)
+      `
+    )
+    .all() as Array<{ d: string; sales: number }>;
+  const salesByDate = new Map(dailySalesRows.map((r) => [r.d, r.sales]));
+
+  const trends = [];
+  let rollingStockVal = totalStockValue;
+  for (let offset = 0; offset >= -9; offset--) {
+    const dt = new Date();
+    dt.setDate(dt.getDate() + offset);
+    const iso = dt.toISOString().slice(0, 10);
+    const label = dt.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
+    const daySales = Number((salesByDate.get(iso) || 0).toFixed(2));
+    trends.unshift({
+      date: iso,
+      label,
+      stock_value: Number(rollingStockVal.toFixed(2)),
+      daily_sales: daySales,
+    });
+    rollingStockVal = Math.max(4000, rollingStockVal + daySales * 0.68 - (offset === -3 ? 1860 : 0));
+  }
+
+  return {
+    kpis: {
+      total_stock_value: Number(totalStockValue.toFixed(2)),
+      total_mrp_value: Number(totalMrpValue.toFixed(2)),
+      at_risk_90d_value: Number(atRisk90dValue.toFixed(2)),
+      at_risk_90d_units: atRisk90dUnits,
+      expired_quarantined_value: Number(expiredValue.toFixed(2)),
+      reorder_count: formattedReorder.length,
+      today_revenue: Number(todayStats.rev.toFixed(2)),
+      today_invoices: todayStats.cnt,
+      pending_rx_count: pendingRxCount,
+    },
+    expiry_shelf: expiryShelf,
+    expiry_summary: {
+      critical_value: Number(criticalValue.toFixed(2)),
+      critical_batches: criticalBatches,
+      amber_value: Number(amberValue.toFixed(2)),
+      amber_batches: amberBatches,
+      green_value: Number(greenValue.toFixed(2)),
+      green_batches: greenBatches,
+    },
+    stock_value_trends: trends,
+    fast_moving_items: fastMoving,
+    reorder_list: formattedReorder,
+  };
+}
+
+function getMedicinesData() {
+  const rows = db
+    .prepare(
+      `
+      SELECT
+        m.*,
+        s.name as preferred_supplier_name,
+        s.phone as preferred_supplier_phone,
+        s.email as preferred_supplier_email,
+        COALESCE(SUM(CASE WHEN b.status = 'active' AND date(b.expiry_date) > date('now') THEN b.qty_available ELSE 0 END), 0) as total_active_stock,
+        COALESCE(SUM(CASE WHEN b.status = 'quarantined' OR date(b.expiry_date) <= date('now') THEN b.qty_available ELSE 0 END), 0) as total_expired_stock,
+        COUNT(CASE WHEN b.status = 'active' AND date(b.expiry_date) > date('now') AND b.qty_available > 0 THEN 1 ELSE NULL END) as active_batch_count,
+        MIN(CASE WHEN b.status = 'active' AND date(b.expiry_date) > date('now') AND b.qty_available > 0 THEN b.expiry_date ELSE NULL END) as earliest_expiry,
+        COALESCE(AVG(CASE WHEN b.status = 'active' AND date(b.expiry_date) > date('now') AND b.qty_available > 0 THEN b.mrp ELSE NULL END), 0) as avg_mrp,
+        COALESCE(AVG(CASE WHEN b.status = 'active' AND date(b.expiry_date) > date('now') AND b.qty_available > 0 THEN b.cost_price ELSE NULL END), 0) as avg_cost
+      FROM medicines m
+      LEFT JOIN suppliers s ON s.id = m.preferred_supplier_id
+      LEFT JOIN batches b ON b.medicine_id = m.id
+      GROUP BY m.id
+      ORDER BY m.brand_name ASC
+      `
+    )
+    .all() as Array<Record<string, unknown>>;
+
+  return rows.map((r) => ({
+    ...r,
+    avg_mrp: Number(Number(r.avg_mrp || 0).toFixed(2)),
+    avg_cost: Number(Number(r.avg_cost || 0).toFixed(2)),
+  }));
+}
+
+function getBatchesData(filter?: string) {
+  const rows = db
+    .prepare(
+      `
+      SELECT b.*, m.brand_name, m.generic_name, m.strength, m.category, m.gst_rate, m.hsn_code
+      FROM batches b
+      JOIN medicines m ON m.id = b.medicine_id
+      ORDER BY date(b.expiry_date) ASC
+      `
+    )
+    .all() as Parameters<typeof mapBatchRow>[0][];
+
+  let mapped = rows.map(mapBatchRow);
+  if (filter === 'near_expiry') {
+    mapped = mapped.filter((b) => b.qty_available > 0 && b.risk_tier !== 'expired' && b.days_to_expiry <= 90);
+  } else if (filter === 'expired') {
+    mapped = mapped.filter((b) => b.qty_available > 0 && b.risk_tier === 'expired');
+  } else if (filter === 'active') {
+    mapped = mapped.filter((b) => b.qty_available > 0 && b.risk_tier !== 'expired');
+  }
+  return mapped;
+}
+
+function getInvoicesData() {
+  const invoices = db
+    .prepare(
+      `
+      SELECT i.*, p.rx_code
+      FROM invoices i
+      LEFT JOIN emr_prescriptions p ON p.id = i.rx_id
+      ORDER BY i.id DESC
+      LIMIT 40
+      `
+    )
+    .all() as Array<Record<string, unknown>>;
+
+  if (invoices.length === 0) return [];
+  const invIds = invoices.map((inv) => Number(inv.id));
+  const placeholders = invIds.map(() => '?').join(',');
+  const allItems = db
+    .prepare(`SELECT * FROM invoice_items WHERE invoice_id IN (${placeholders}) ORDER BY id ASC`)
+    .all(...invIds) as Array<Record<string, unknown>>;
+
+  const itemsByInv = new Map<number, Array<Record<string, unknown>>>();
+  for (const item of allItems) {
+    const key = Number(item.invoice_id);
+    const list = itemsByInv.get(key);
+    if (list) list.push(item);
+    else itemsByInv.set(key, [item]);
+  }
+
+  return invoices.map((inv) => ({
+    ...inv,
+    rx_code: inv.rx_code ?? null,
+    items: itemsByInv.get(Number(inv.id)) || [],
+  }));
+}
+
+function getPrescriptionsData() {
+  const rxRows = db.prepare('SELECT * FROM emr_prescriptions ORDER BY id DESC').all() as Array<{
+    id: number;
+    rx_code: string;
+    patient_name: string;
+    patient_age: number;
+    patient_gender: string;
+    patient_phone: string;
+    allergies: string;
+    doctor_name: string;
+    department: string;
+    emr_notes: string;
+    status: 'Pending' | 'Reviewed' | 'Dispensed';
+    created_at: string;
+  }>;
+
+  if (rxRows.length === 0) return [];
+
+  const allItems = db
+    .prepare(
+      `
+      SELECT
+        epi.id,
+        epi.prescription_id,
+        epi.medicine_id,
+        m.brand_name,
+        m.generic_name,
+        m.strength,
+        epi.dosage_instruction,
+        epi.prescribed_qty,
+        COALESCE((
+          SELECT SUM(qty_available) FROM batches b
+          WHERE b.medicine_id = m.id AND b.status = 'active' AND date(b.expiry_date) > date('now')
+        ), 0) as available_stock
+      FROM emr_prescription_items epi
+      JOIN medicines m ON m.id = epi.medicine_id
+      `
+    )
+    .all() as Array<{
+    id: number;
+    prescription_id: number;
+    medicine_id: number;
+    brand_name: string;
+    generic_name: string;
+    strength: string;
+    dosage_instruction: string;
+    prescribed_qty: number;
+    available_stock: number;
+  }>;
+
+  const itemsByRx = new Map<number, typeof allItems>();
+  for (const it of allItems) {
+    const list = itemsByRx.get(it.prescription_id);
+    if (list) list.push(it);
+    else itemsByRx.set(it.prescription_id, [it]);
+  }
+
+  const swapCache = new Map<number, BrandSwapOption[]>();
+
+  return rxRows.map((rx) => {
+    const items = itemsByRx.get(rx.id) || [];
+    const enrichedItems = items.map((it) => {
+      let swaps: BrandSwapOption[] = [];
+      if (it.available_stock < it.prescribed_qty) {
+        if (!swapCache.has(it.medicine_id)) {
+          swapCache.set(it.medicine_id, findBrandSwaps(it.medicine_id, it.generic_name));
+        }
+        swaps = swapCache.get(it.medicine_id)!;
+      }
+      return { ...it, brand_swaps: swaps };
+    });
+    const interactions = checkInteractionsForMedicines(
+      enrichedItems.map((it) => ({
+        medicine_id: it.medicine_id,
+        brand_name: it.brand_name,
+        generic_name: it.generic_name,
+      }))
+    );
+    return {
+      ...rx,
+      items: enrichedItems,
+      interactions,
+    };
+  });
+}
+
+function getReturnsData() {
+  return db
+    .prepare(
+      `
+      SELECT r.*, m.brand_name, b.batch_no
+      FROM returns_reconciliation r
+      JOIN medicines m ON m.id = r.medicine_id
+      JOIN batches b ON b.id = r.batch_id
+      ORDER BY r.id DESC
+      `
+    )
+    .all();
+}
+
+function getSuppliersData() {
+  return db.prepare('SELECT * FROM suppliers ORDER BY name ASC').all();
+}
+
+function getPurchaseOrdersData() {
+  const pos = db
+    .prepare(
+      `
+      SELECT po.*, s.name as supplier_name, s.email as supplier_email, s.phone as supplier_phone
+      FROM purchase_orders po
+      JOIN suppliers s ON s.id = po.supplier_id
+      ORDER BY po.id DESC
+      `
+    )
+    .all() as Array<Record<string, unknown>>;
+
+  if (pos.length === 0) return [];
+  const allItems = db
+    .prepare(
+      `
+      SELECT poi.*, m.brand_name, m.generic_name
+      FROM purchase_order_items poi
+      JOIN medicines m ON m.id = poi.medicine_id
+      `
+    )
+    .all() as Array<Record<string, unknown>>;
+
+  const itemsByPo = new Map<number, Array<Record<string, unknown>>>();
+  for (const it of allItems) {
+    const key = Number(it.po_id);
+    const list = itemsByPo.get(key);
+    if (list) list.push(it);
+    else itemsByPo.set(key, [it]);
+  }
+
+  return pos.map((po) => ({ ...po, items: itemsByPo.get(Number(po.id)) || [] }));
+}
+
+function getGrnData() {
+  return db
+    .prepare(
+      `
+      SELECT g.*, s.name as supplier_name, po.po_number
+      FROM grn_records g
+      JOIN suppliers s ON s.id = g.supplier_id
+      LEFT JOIN purchase_orders po ON po.id = g.po_id
+      ORDER BY g.id DESC
+      `
+    )
+    .all();
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '4mb' }));
+
+  // Lightweight gzip compression for JSON API payloads
+  app.use('/api', (req, res, next) => {
+    const origJson = res.json.bind(res);
+    res.json = ((body: unknown) => {
+      const accept = String(req.headers['accept-encoding'] || '');
+      const jsonStr = JSON.stringify(body);
+      if (accept.includes('gzip') && jsonStr.length > 1024) {
+        const compressed = zlib.gzipSync(jsonStr);
+        res.setHeader('Content-Encoding', 'gzip');
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Vary', 'Accept-Encoding');
+        return res.send(compressed);
+      }
+      return origJson(body);
+    }) as typeof res.json;
+    next();
+  });
+
+  // 0. Consolidated single-roundtrip workspace bootstrap
+  app.get('/api/bootstrap', (_req, res) => {
+    const payload = db.transaction(() => ({
+      dashboard: getDashboardData(),
+      medicines: getMedicinesData(),
+      batches: getBatchesData(),
+      prescriptions: getPrescriptionsData(),
+      invoices: getInvoicesData(),
+      returns: getReturnsData(),
+      suppliers: getSuppliersData(),
+      purchase_orders: getPurchaseOrdersData(),
+      grn_records: getGrnData(),
+    }))();
+    res.json(payload);
+  });
 
   // 1. Auth & Role Switcher
   app.post('/api/auth/login', (req, res) => {
@@ -329,244 +818,14 @@ async function startServer() {
     });
   });
 
-  // 2. Dashboard Aggregations (Expiry Shelf, Stock Value Trends, Fast-Moving Items, Reorder List)
+  // 2. Dashboard Aggregations
   app.get('/api/dashboard', (_req, res) => {
-    const allBatchRows = db
-      .prepare(
-        `
-        SELECT b.*, m.brand_name, m.generic_name, m.strength, m.category, m.gst_rate, m.hsn_code
-        FROM batches b
-        JOIN medicines m ON m.id = b.medicine_id
-        WHERE b.qty_available > 0
-        ORDER BY date(b.expiry_date) ASC
-        `
-      )
-      .all() as Parameters<typeof mapBatchRow>[0][];
-
-    const mappedBatches = allBatchRows.map(mapBatchRow);
-
-    let totalStockValue = 0;
-    let totalMrpValue = 0;
-    let atRisk90dValue = 0;
-    let atRisk90dUnits = 0;
-    let expiredValue = 0;
-
-    let criticalValue = 0;
-    let criticalBatches = 0;
-    let amberValue = 0;
-    let amberBatches = 0;
-    let greenValue = 0;
-    let greenBatches = 0;
-
-    const expiryShelf = [];
-
-    for (const b of mappedBatches) {
-      if (b.risk_tier === 'expired') {
-        expiredValue += b.cost_value_at_risk;
-      } else {
-        totalStockValue += b.cost_value_at_risk;
-        totalMrpValue += b.qty_available * b.mrp;
-        if (b.days_to_expiry <= 90) {
-          atRisk90dValue += b.cost_value_at_risk;
-          atRisk90dUnits += b.qty_available;
-          expiryShelf.push(b);
-          if (b.risk_tier === 'critical') {
-            criticalValue += b.cost_value_at_risk;
-            criticalBatches += 1;
-          } else if (b.risk_tier === 'amber') {
-            amberValue += b.cost_value_at_risk;
-            amberBatches += 1;
-          } else if (b.risk_tier === 'green') {
-            greenValue += b.cost_value_at_risk;
-            greenBatches += 1;
-          }
-        }
-      }
-    }
-
-    const reorderList = db
-      .prepare(
-        `
-        SELECT
-          m.id as medicine_id,
-          m.brand_name,
-          m.generic_name,
-          m.strength,
-          m.category,
-          COALESCE(SUM(CASE WHEN b.status = 'active' AND date(b.expiry_date) > date('now') THEN b.qty_available ELSE 0 END), 0) as current_stock,
-          m.reorder_level,
-          m.target_stock,
-          COALESCE(
-            (SELECT cost_price FROM batches b2 WHERE b2.medicine_id = m.id ORDER BY b2.id DESC LIMIT 1),
-            10.0
-          ) as est_unit_cost,
-          s.id as supplier_id,
-          s.name as supplier_name,
-          s.phone as supplier_phone,
-          s.email as supplier_email,
-          s.lead_time_days
-        FROM medicines m
-        JOIN suppliers s ON s.id = m.preferred_supplier_id
-        LEFT JOIN batches b ON b.medicine_id = m.id
-        GROUP BY m.id
-        HAVING current_stock <= m.reorder_level
-        ORDER BY (m.reorder_level - current_stock) DESC
-        `
-      )
-      .all() as Array<{
-      medicine_id: number;
-      brand_name: string;
-      generic_name: string;
-      strength: string;
-      category: string;
-      current_stock: number;
-      reorder_level: number;
-      target_stock: number;
-      est_unit_cost: number;
-      supplier_id: number;
-      supplier_name: string;
-      supplier_phone: string;
-      supplier_email: string;
-      lead_time_days: number;
-    }>;
-
-    const formattedReorder = reorderList.map((r) => {
-      const suggested = Math.max(r.target_stock - r.current_stock, r.reorder_level);
-      return {
-        ...r,
-        est_unit_cost: Number(r.est_unit_cost.toFixed(2)),
-        suggested_order_qty: suggested,
-        est_order_cost: Number((suggested * r.est_unit_cost).toFixed(2)),
-      };
-    });
-
-    const today = todayIso();
-    const todayStats = db
-      .prepare(
-        `
-        SELECT COALESCE(SUM(grand_total), 0) as rev, COUNT(*) as cnt
-        FROM invoices
-        WHERE date(created_at) = date(?)
-        `
-      )
-      .get(today) as { rev: number; cnt: number };
-
-    const pendingRxCount = (
-      db.prepare("SELECT COUNT(*) as cnt FROM emr_prescriptions WHERE status != 'Dispensed'").get() as { cnt: number }
-    ).cnt;
-
-    const fastMoving = db
-      .prepare(
-        `
-        SELECT
-          ii.medicine_id,
-          ii.brand_name,
-          ii.generic_name,
-          m.strength,
-          SUM(ii.qty) as units_sold,
-          ROUND(SUM(ii.line_total), 2) as revenue,
-          COALESCE((
-            SELECT SUM(qty_available) FROM batches b
-            WHERE b.medicine_id = ii.medicine_id AND b.status = 'active' AND date(b.expiry_date) > date('now')
-          ), 0) as current_stock
-        FROM invoice_items ii
-        JOIN medicines m ON m.id = ii.medicine_id
-        GROUP BY ii.medicine_id
-        ORDER BY units_sold DESC
-        LIMIT 6
-        `
-      )
-      .all();
-
-    // Build 10-day Stock Value Trend anchored to real current stock value & daily sales
-    const dailySalesRows = db
-      .prepare(
-        `
-        SELECT date(created_at) as d, COALESCE(SUM(grand_total), 0) as sales
-        FROM invoices
-        GROUP BY date(created_at)
-        `
-      )
-      .all() as Array<{ d: string; sales: number }>;
-    const salesByDate = new Map(dailySalesRows.map((r) => [r.d, r.sales]));
-
-    const trends = [];
-    let rollingStockVal = totalStockValue;
-    for (let offset = 0; offset >= -9; offset--) {
-      const dt = new Date();
-      dt.setDate(dt.getDate() + offset);
-      const iso = dt.toISOString().slice(0, 10);
-      const label = dt.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
-      const daySales = Number((salesByDate.get(iso) || 0).toFixed(2));
-      trends.unshift({
-        date: iso,
-        label,
-        stock_value: Number(rollingStockVal.toFixed(2)),
-        daily_sales: daySales,
-      });
-      // Reconstruct earlier days gently based on sales outflow and prior GRN restocks
-      rollingStockVal = Math.max(4000, rollingStockVal + daySales * 0.68 - (offset === -3 ? 1860 : 0));
-    }
-
-    res.json({
-      kpis: {
-        total_stock_value: Number(totalStockValue.toFixed(2)),
-        total_mrp_value: Number(totalMrpValue.toFixed(2)),
-        at_risk_90d_value: Number(atRisk90dValue.toFixed(2)),
-        at_risk_90d_units: atRisk90dUnits,
-        expired_quarantined_value: Number(expiredValue.toFixed(2)),
-        reorder_count: formattedReorder.length,
-        today_revenue: Number(todayStats.rev.toFixed(2)),
-        today_invoices: todayStats.cnt,
-        pending_rx_count: pendingRxCount,
-      },
-      expiry_shelf: expiryShelf,
-      expiry_summary: {
-        critical_value: Number(criticalValue.toFixed(2)),
-        critical_batches: criticalBatches,
-        amber_value: Number(amberValue.toFixed(2)),
-        amber_batches: amberBatches,
-        green_value: Number(greenValue.toFixed(2)),
-        green_batches: greenBatches,
-      },
-      stock_value_trends: trends,
-      fast_moving_items: fastMoving,
-      reorder_list: formattedReorder,
-    });
+    res.json(getDashboardData());
   });
 
   // 3. Medicines Catalog
   app.get('/api/medicines', (_req, res) => {
-    const rows = db
-      .prepare(
-        `
-        SELECT
-          m.*,
-          s.name as preferred_supplier_name,
-          s.phone as preferred_supplier_phone,
-          s.email as preferred_supplier_email,
-          COALESCE(SUM(CASE WHEN b.status = 'active' AND date(b.expiry_date) > date('now') THEN b.qty_available ELSE 0 END), 0) as total_active_stock,
-          COALESCE(SUM(CASE WHEN b.status = 'quarantined' OR date(b.expiry_date) <= date('now') THEN b.qty_available ELSE 0 END), 0) as total_expired_stock,
-          COUNT(CASE WHEN b.status = 'active' AND date(b.expiry_date) > date('now') AND b.qty_available > 0 THEN 1 ELSE NULL END) as active_batch_count,
-          MIN(CASE WHEN b.status = 'active' AND date(b.expiry_date) > date('now') AND b.qty_available > 0 THEN b.expiry_date ELSE NULL END) as earliest_expiry,
-          COALESCE(AVG(CASE WHEN b.status = 'active' AND date(b.expiry_date) > date('now') AND b.qty_available > 0 THEN b.mrp ELSE NULL END), 0) as avg_mrp,
-          COALESCE(AVG(CASE WHEN b.status = 'active' AND date(b.expiry_date) > date('now') AND b.qty_available > 0 THEN b.cost_price ELSE NULL END), 0) as avg_cost
-        FROM medicines m
-        LEFT JOIN suppliers s ON s.id = m.preferred_supplier_id
-        LEFT JOIN batches b ON b.medicine_id = m.id
-        GROUP BY m.id
-        ORDER BY m.brand_name ASC
-        `
-      )
-      .all() as Array<Record<string, unknown>>;
-
-    res.json(
-      rows.map((r) => ({
-        ...r,
-        avg_mrp: Number(Number(r.avg_mrp || 0).toFixed(2)),
-        avg_cost: Number(Number(r.avg_cost || 0).toFixed(2)),
-      }))
-    );
+    res.json(getMedicinesData());
   });
 
   app.post('/api/medicines', (req, res) => {
@@ -623,26 +882,7 @@ async function startServer() {
   // 4. Batches & Expiry Tracking
   app.get('/api/batches', (req, res) => {
     const { filter } = req.query as { filter?: string };
-    const rows = db
-      .prepare(
-        `
-        SELECT b.*, m.brand_name, m.generic_name, m.strength, m.category, m.gst_rate, m.hsn_code
-        FROM batches b
-        JOIN medicines m ON m.id = b.medicine_id
-        ORDER BY date(b.expiry_date) ASC
-        `
-      )
-      .all() as Parameters<typeof mapBatchRow>[0][];
-
-    let mapped = rows.map(mapBatchRow);
-    if (filter === 'near_expiry') {
-      mapped = mapped.filter((b) => b.qty_available > 0 && b.risk_tier !== 'expired' && b.days_to_expiry <= 90);
-    } else if (filter === 'expired') {
-      mapped = mapped.filter((b) => b.qty_available > 0 && b.risk_tier === 'expired');
-    } else if (filter === 'active') {
-      mapped = mapped.filter((b) => b.qty_available > 0 && b.risk_tier !== 'expired');
-    }
-    res.json(mapped);
+    res.json(getBatchesData(filter));
   });
 
   app.post('/api/batches', (req, res) => {
@@ -823,17 +1063,7 @@ async function startServer() {
   });
 
   app.get('/api/invoices', (_req, res) => {
-    const invoices = db.prepare('SELECT * FROM invoices ORDER BY id DESC LIMIT 40').all() as Array<Record<string, unknown>>;
-    const getItems = db.prepare('SELECT * FROM invoice_items WHERE invoice_id = ?');
-    const getRxCode = db.prepare('SELECT rx_code FROM emr_prescriptions WHERE id = ?');
-
-    res.json(
-      invoices.map((inv) => ({
-        ...inv,
-        rx_code: inv.rx_id ? ((getRxCode.get(inv.rx_id) as { rx_code: string } | undefined)?.rx_code ?? null) : null,
-        items: getItems.all(inv.id),
-      }))
-    );
+    res.json(getInvoicesData());
   });
 
   app.post('/api/invoices', (req, res) => {
@@ -969,69 +1199,7 @@ async function startServer() {
 
   // 6. EMR Digital Prescriptions
   app.get('/api/prescriptions', (_req, res) => {
-    const rxRows = db.prepare('SELECT * FROM emr_prescriptions ORDER BY id DESC').all() as Array<{
-      id: number;
-      rx_code: string;
-      patient_name: string;
-      patient_age: number;
-      patient_gender: string;
-      patient_phone: string;
-      allergies: string;
-      doctor_name: string;
-      department: string;
-      emr_notes: string;
-      status: 'Pending' | 'Reviewed' | 'Dispensed';
-      created_at: string;
-    }>;
-
-    const getItems = db.prepare(`
-      SELECT
-        epi.id,
-        epi.medicine_id,
-        m.brand_name,
-        m.generic_name,
-        m.strength,
-        epi.dosage_instruction,
-        epi.prescribed_qty,
-        COALESCE((
-          SELECT SUM(qty_available) FROM batches b
-          WHERE b.medicine_id = m.id AND b.status = 'active' AND date(b.expiry_date) > date('now')
-        ), 0) as available_stock
-      FROM emr_prescription_items epi
-      JOIN medicines m ON m.id = epi.medicine_id
-      WHERE epi.prescription_id = ?
-    `);
-
-    const result = rxRows.map((rx) => {
-      const items = getItems.all(rx.id) as Array<{
-        id: number;
-        medicine_id: number;
-        brand_name: string;
-        generic_name: string;
-        strength: string;
-        dosage_instruction: string;
-        prescribed_qty: number;
-        available_stock: number;
-      }>;
-      const enrichedItems = items.map((it) => ({
-        ...it,
-        brand_swaps: it.available_stock < it.prescribed_qty ? findBrandSwaps(it.medicine_id, it.generic_name) : [],
-      }));
-      const interactions = checkInteractionsForMedicines(
-        enrichedItems.map((it) => ({
-          medicine_id: it.medicine_id,
-          brand_name: it.brand_name,
-          generic_name: it.generic_name,
-        }))
-      );
-      return {
-        ...rx,
-        items: enrichedItems,
-        interactions,
-      };
-    });
-
-    res.json(result);
+    res.json(getPrescriptionsData());
   });
 
   app.post('/api/prescriptions/:id/swap', (req, res) => {
@@ -1118,18 +1286,7 @@ async function startServer() {
 
   // 7. Returns & Reconciliation
   app.get('/api/returns', (_req, res) => {
-    const rows = db
-      .prepare(
-        `
-        SELECT r.*, m.brand_name, b.batch_no
-        FROM returns_reconciliation r
-        JOIN medicines m ON m.id = r.medicine_id
-        JOIN batches b ON b.id = r.batch_id
-        ORDER BY r.id DESC
-        `
-      )
-      .all();
-    res.json(rows);
+    res.json(getReturnsData());
   });
 
   app.post('/api/returns', (req, res) => {
@@ -1225,7 +1382,7 @@ async function startServer() {
 
   // 8. Suppliers, Purchase Orders & GRN
   app.get('/api/suppliers', (_req, res) => {
-    res.json(db.prepare('SELECT * FROM suppliers ORDER BY name ASC').all());
+    res.json(getSuppliersData());
   });
 
   app.post('/api/suppliers', (req, res) => {
@@ -1256,25 +1413,7 @@ async function startServer() {
   });
 
   app.get('/api/purchase-orders', (_req, res) => {
-    const pos = db
-      .prepare(
-        `
-        SELECT po.*, s.name as supplier_name, s.email as supplier_email, s.phone as supplier_phone
-        FROM purchase_orders po
-        JOIN suppliers s ON s.id = po.supplier_id
-        ORDER BY po.id DESC
-        `
-      )
-      .all() as Array<Record<string, unknown>>;
-
-    const getItems = db.prepare(`
-      SELECT poi.*, m.brand_name, m.generic_name
-      FROM purchase_order_items poi
-      JOIN medicines m ON m.id = poi.medicine_id
-      WHERE poi.po_id = ?
-    `);
-
-    res.json(pos.map((po) => ({ ...po, items: getItems.all(po.id) })));
+    res.json(getPurchaseOrdersData());
   });
 
   app.post('/api/purchase-orders', (req, res) => {
@@ -1341,18 +1480,7 @@ async function startServer() {
   });
 
   app.get('/api/grn', (_req, res) => {
-    const rows = db
-      .prepare(
-        `
-        SELECT g.*, s.name as supplier_name, po.po_number
-        FROM grn_records g
-        JOIN suppliers s ON s.id = g.supplier_id
-        LEFT JOIN purchase_orders po ON po.id = g.po_id
-        ORDER BY g.id DESC
-        `
-      )
-      .all();
-    res.json(rows);
+    res.json(getGrnData());
   });
 
   app.post('/api/grn', (req, res) => {
@@ -1564,7 +1692,14 @@ CREATE TABLE drug_interactions (
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distDir));
+    app.use(
+      '/assets',
+      express.static(path.join(distDir, 'assets'), {
+        maxAge: '1y',
+        immutable: true,
+      })
+    );
+    app.use(express.static(distDir, { maxAge: '1h' }));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distDir, 'index.html'));
     });

@@ -73,12 +73,12 @@ export function BillingView({
 
   // Live FEFO + Drug Interaction + Brand-Swap preview from SQLite backend
   useEffect(() => {
+    if (cart.length === 0) {
+      setPreview(null);
+      return;
+    }
     let cancelled = false;
-    async function runPreview() {
-      if (cart.length === 0) {
-        setPreview(null);
-        return;
-      }
+    const timer = window.setTimeout(async () => {
       setLoadingPreview(true);
       try {
         const res = await apiFetch<BillingPreviewResponse>('/api/billing/preview', {
@@ -94,10 +94,10 @@ export function BillingView({
       } finally {
         if (!cancelled) setLoadingPreview(false);
       }
-    }
-    runPreview();
+    }, 100);
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
   }, [cart]);
 
